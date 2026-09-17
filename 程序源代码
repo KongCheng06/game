@@ -283,3 +283,126 @@ def draw_shaking_arrow(self, screen):
     # 红色闪烁
     color = lerp_color(DIR_COLORS[arrow.direction], RED, math.sin(p * math.pi))
     self.draw_arrow(screen, arrow, rect, color)
+class Game:
+    """游戏主逻辑：选关、关卡管理、点击判定、动画、音效与绘制"""
+    def __init__(self):
+        self.quit = False
+        self.progress = load_progress()   # 存档：解锁进度 / 星级 / 无尽最高分
+        self.state = "menu"               # menu / play / win / fail
+        self.mode = "level"               # level（固定关卡）/ endless（无尽模式）
+        self.level = 1
+        self.anim = None                  # 当前播放的动画
+        self.floaters = []                # 浮动提示文字
+        self.particles = []               # 粒子（箭头飞出时的光点）
+        self.overlay_btns = []            # 结算界面按钮
+        self.ai_solving = False           # AI 求解中
+        self.ai_order = []                # AI 预计算的消除顺序
+        self.hint = None                  # 提示高亮：{"cell": (r,c), "t": 剩余秒}
+        self.hints_left = 3               # 本关剩余提示次数
+        self.undo_stack = []              # 已消除箭头的撤销栈
+        self.elapsed = 0.0                # 本关用时
+        self.score = 0                    # 本关得分
+        self.win_stars = 0                # 本关获胜星级
+        # 游戏中的四个操作按钮
+        self.play_btns = []
+        x = (WINDOW_W - 150 - 150 - 120 - 160 - 12 * 3) // 2
+        for text, w, cb in (("重新开始本关", 150, self.restart_level),
+                            ("提示 ×3", 150, self.use_hint),
+                            ("撤销", 120, self.undo_last),
+                            ("AI 求解", 160, self.start_ai_solve)):
+            self.play_btns.append(Button(pygame.Rect(x, 772, w, 40), text, cb))
+            x += w + 12
+        self.restart_btn, self.hint_btn, self.undo_btn, self.ai_btn = self.play_btns
+        # 选关界面按钮
+        self.level_btns = []
+        for n in range(1, len(LEVELS) + 1):
+            col, row = (n - 1) % 3, (n - 1) // 3
+            self.level_btns.append(LevelButton(pygame.Rect(55 + col * 190, 220 + row * 100, 170, 80),
+                                               n, lambda n=n: self.start_level(n)))
+        self.menu_btns = [
+            Button(pygame.Rect(0, 0, 300, 54), "无尽模式", self.start_endless),
+            Button(pygame.Rect(0, 0, 300, 54), "退出游戏", self.quit_game),
+        ]
+        self.menu_btns[0].rect.center = (WINDOW_W // 2, 470)
+        self.menu_btns[1].rect.center = (WINDOW_W // 2, 545)
+
+    # ---------------- 关卡管理 ----------------
+    def load_level(self, level):
+        self.mode = "level"
+        self.level = level
+        grid, count, mistakes, bias = LEVELS[level - 1]
+        self.grid = grid
+        layout = None
+        while layout is None:
+            for _ in range(100):      # 多次随机尝试，避免密度过高时生成失败
+                layout = generate_arrows(grid, count, bias)
+                if layout is not None:
+                    break
+            if layout is None:        # 仍然失败则降低箭头数量再试
+                count -= 1
+        self.layout = layout
+        self.mistakes_total = mistakes
+        self._reset_level()
+
+    def load_endless(self, index):
+        """无尽模式：难度随层数持续递增，上限封顶后保持不变（保证可生成）"""
+        self.mode = "endless"
+        self.level = index
+        grid = min(4 + (index - 1) // 3, 6)
+        count = min({4: 8, 5: 13, 6: 20}[grid], 4 + 2 * index)
+        mistakes = max(2, 5 - (index - 1) // 3)
+        bias = min(0.8, 0.05 + 0.1 * index)
+        self.grid = grid
+        layout = None
+        while layout is None:
+            for _ in range(100):
+                layout = generate_arrows(grid, count, bias)
+                if layout is not None:
+                    break
+            if layout is None:
+                count -= 1
+        self.layout = layout
+        self.mistakes_total = mistakes
+        self._reset_level()
+
+    def _reset_level(self):
+        """进入/重开一关：布局不变，重置箭头、失误机会与本关全部统计"""
+        self.arrows = {(r, c): Arrow(r, c, d) for (r, c), d in self.layout.items()}
+        self.mistakes_left = self.mistakes_total
+        self.anim = None
+        self.floaters.clear()
+        self.particles.clear()
+        self.overlay_btns = []
+        self.ai_solving = False
+        self.ai_order = []
+        self.hint = None
+        self.hints_left = 3
+        self.undo_stack = []
+        self.elapsed = 0.0
+        self.score = 0
+        self.state = "play"
+
+    def restart_level(self):
+        self._reset_level()
+
+    def start_level(self, n):
+        self.load_level(n)
+
+    def start_endless(self):
+        self.load_endless(1)
+
+    def next_level(self):
+        if self.mode == "endless":
+            self.load_endless(self.level + 1)
+        elif self.level < len(LEVELS):
+            self.load_level(self.level + 1)
+        else:
+            self.enter_menu()
+
+    def enter_menu(self):
+        self.state = "menu"
+        self.anim = None
+        self.ai_solving = False
+
+    def quit_game(self):
+        self.quit = True
