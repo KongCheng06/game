@@ -1,3 +1,43 @@
+# -*- coding: utf-8 -*-
+"""
+箭头消消乐 —— 点箭头消除小游戏（赛博朋克风 · 基础玩法 + 增强功能）
+
+基础玩法规则：
+1. 棋盘是若干行 × 若干列的网格，部分格子中有一个单格箭头，方向为上 / 下 / 左 / 右。
+2. 点击某个箭头后，程序沿其箭头方向检查到棋盘边界的路径（只判断同一行或同一列）：
+   - 路径上没有其他箭头：该箭头飞出棋盘并被消除；
+   - 路径上存在其他箭头：该箭头无法消除，通过"晃动 + 变红 + 文字提示"反馈碰撞，
+     并消耗 1 次失误机会（阻挡它的箭头会高亮显示）。
+3. 清除本关全部箭头即可进入下一关；失误机会用完则本关失败，可重新开始本关。
+
+增强功能：
+- 关卡选择界面 + 无尽模式（随机生成、难度持续递增，所有布局保证可通关）
+- 星级评价（按失误次数评 1~3 星）+ 得分 + 计时，进度自动保存到 save.json
+- 提示功能（每关 3 次，高亮一个可安全消除的箭头）
+- 撤销上一步（恢复最近消除的箭头）
+- AI 自动求解当前关卡（贪心模拟消除顺序，0 失误通关）
+- 合成音效（正弦波实时合成，无需外部音频文件）与粒子飞散动画
+- 界面为赛博朋克风格：深色背景 + 霓虹光晕
+
+运行方法：
+    pip install pygame
+    python game.py
+
+打包为可执行文件（详见 README.md）：
+    pip install pyinstaller
+    pyinstaller --onefile --noconsole --name ArrowGame game.py
+"""
+
+# ---------------------------------------------------------------------------
+# 提交记录（与源码位置对应，便于追溯）：
+#   feat: 完成游戏棋盘和箭头显示      -> Game.draw_play 棋盘与箭头绘制
+#   feat: 实现四个方向的路径检测      -> first_arrow_on_path
+#   feat: 增加碰撞反馈和失误次数      -> Game.click_arrow
+#   feat: 增加关卡切换功能           -> Game.load_level / next_level
+#   fix: 修复向上检测时的数组越界      -> first_arrow_on_path 边界守卫
+#   docs: 完善README和运行说明        -> 详见 README.md
+# ---------------------------------------------------------------------------
+
 import json
 import math
 import os
@@ -5,6 +45,8 @@ import random
 import sys
 
 import pygame
+
+# ---------------------------------------------------------------------------
 # 基本配置
 # ---------------------------------------------------------------------------
 WINDOW_W, WINDOW_H = 660, 860    # 窗口大小
@@ -54,7 +96,94 @@ PANEL_BG = (20, 24, 52)         # 结算面板底色
 DIR_COLORS = {"up": (57, 255, 120), "down": (0, 210, 255),
               "left": (255, 214, 64), "right": (255, 64, 180)}
 
-# 字体、绘制工具函数
+
+# ---------------------------------------------------------------------------
+# 音效：用正弦波实时合成，无需外部音频文件
+# ---------------------------------------------------------------------------
+SOUNDS = {}  # 名称 -> pygame.mixer.Sound，初始化失败时保持为空（静音运行）
+
+
+def synth_sound(segments, volume=0.35):
+    """用正弦波合成 16 位单声道 WAV 数据，segments 为 [(起频, 止频, 时长)] 列表"""
+    import array
+    rate = 22050
+    total = sum(d for _, _, d in segments) + 0.05
+    samples = array.array("h", bytes(2 * int(rate * total)))
+    pos = 0
+    for f0, f1, dur in segments:
+        m = int(rate * dur)
+        phase = 0.0
+        for i in range(m):
+            f = f0 + (f1 - f0) * (i / max(1, m - 1))
+            phase += 2 * math.pi * f / rate
+            env = min(1.0, i / (0.008 * rate), (m - i) / (0.02 * rate))  # 起落包络防爆音
+            samples[pos + i] = int(32000 * volume * env * math.sin(phase))
+        pos += m
+    return samples.tobytes()
+
+
+def init_sounds():
+    """初始化合成音效；音频设备不可用时静音运行，不影响游戏"""
+    try:
+        pygame.mixer.init(22050, -16, 1, 512)
+    except pygame.error:
+        return
+    defs = {
+        "fly":  [(500, 950, 0.16)],                          # 飞出：上扬滑音
+        "hit":  [(180, 90, 0.22)],                           # 碰撞：低沉下滑
+        "win":  [(523, 523, 0.10), (659, 659, 0.10), (784, 784, 0.18)],   # 过关琶音
+        "fail": [(330, 330, 0.12), (247, 247, 0.12), (185, 185, 0.22)],   # 失败下行
+        "click": [(760, 760, 0.05)],                         # 按钮短音
+        "hint":  [(880, 1400, 0.12)],                        # 提示音
+        "undo":  [(620, 420, 0.10)],                         # 撤销音
+    }
+    for name, segs in defs.items():
+        try:
+            SOUNDS[name] = pygame.mixer.Sound(buffer=synth_sound(segs))
+        except pygame.error:
+            SOUNDS[name] = None
+
+
+def play_sound(name):
+    """播放指定音效；未初始化时静默跳过"""
+    s = SOUNDS.get(name)
+    if s:
+        s.play()
+
+
+# ---------------------------------------------------------------------------
+# 存档：保存到 save.json（打包后位于 exe 同目录）
+# ---------------------------------------------------------------------------
+def save_path():
+    if getattr(sys, "frozen", False):          # PyInstaller 打包后
+        return os.path.join(os.path.dirname(sys.executable), "save.json")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "save.json")
+
+
+def load_progress():
+    """读取存档：已解锁关卡、各关最好星级、无尽模式最高分"""
+    try:
+        with open(save_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return {"unlocked": int(data.get("unlocked", 1)),
+                "stars": {int(k): int(v) for k, v in data.get("stars", {}).items()},
+                "endless_best": int(data.get("endless_best", 0))}
+    except (OSError, ValueError):
+        return {"unlocked": 1, "stars": {}, "endless_best": 0}
+
+
+def save_progress(progress):
+    """写回存档；写入失败不影响游戏运行"""
+    try:
+        with open(save_path(), "w", encoding="utf-8") as f:
+            json.dump(progress, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
 def get_font(size, bold=False):
     """尽量匹配中文字体，保证中文正常显示"""
     if not pygame.font.get_init():
@@ -65,6 +194,7 @@ def get_font(size, bold=False):
             return pygame.font.Font(path, size)
     return pygame.font.SysFont(None, size, bold=bold)
 
+
 FONT_BIG = get_font(52, True)
 FONT_TITLE = get_font(38, True)
 FONT_MED = get_font(24)
@@ -74,17 +204,21 @@ FONT_BTN = get_font(20)
 FONT_OVERLAY = get_font(32, True)
 FONT_SUB = get_font(18)
 
+
 def fmt_time(sec):
     """秒数格式化为 mm:ss"""
     return f"{int(sec) // 60:02d}:{int(sec) % 60:02d}"
+
 
 def scaled_color(c, f):
     """颜色按系数变暗（用于霓虹光晕与粒子渐隐）"""
     return tuple(int(min(255, x * f)) for x in c)
 
+
 def lerp_color(c1, c2, t):
     """颜色线性插值，t 取值 0~1"""
     return tuple(int(a + (b - a) * t) for a, b in zip(c1, c2))
+
 
 def grow_polygon(points, m):
     """多边形按包围盒中心向外扩张 m 像素（用于霓虹光晕）"""
@@ -97,11 +231,13 @@ def grow_polygon(points, m):
     cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
     return [(cx + (x - cx) * kx, cy + (y - cy) * ky) for x, y in points]
 
+
 def draw_neon_polygon(screen, points, color):
     """霓虹光晕多边形：两层放大的暗色光晕 + 本体"""
     pygame.draw.polygon(screen, scaled_color(color, 0.22), grow_polygon(points, 9))
     pygame.draw.polygon(screen, scaled_color(color, 0.50), grow_polygon(points, 4))
     pygame.draw.polygon(screen, color, points)
+
 
 def arrow_polygon(rect, direction):
     """在 rect 范围内生成一个朝 direction 方向的箭头多边形（箭杆 + 三角箭头）"""
@@ -128,6 +264,7 @@ def arrow_polygon(rect, direction):
     return [(cx - shaft_half, y1), (cx - shaft_half, by), (cx - head_half, by),
             (cx, y0), (cx + head_half, by), (cx + shaft_half, by), (cx + shaft_half, y1)]
 
+
 def draw_heart(screen, cx, cy, size, color, filled=True):
     """在 (cx, cy) 处矢量绘制一个心形（不依赖字体字形），size 为心形宽高"""
     r = max(2, size // 4)
@@ -142,6 +279,7 @@ def draw_heart(screen, cx, cy, size, color, filled=True):
         pygame.draw.polygon(screen, color,
                             [(cx - 2 * r, cy - r + 1), (cx + 2 * r, cy - r + 1), (cx, cy + 2 * r)], 2)
 
+
 def draw_star(screen, cx, cy, size, color, filled=True):
     """在 (cx, cy) 处矢量绘制一个五角星（星级评价用），size 为外接圆半径"""
     pts = []
@@ -150,6 +288,7 @@ def draw_star(screen, cx, cy, size, color, filled=True):
         a = -math.pi / 2 + i * math.pi / 5
         pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
     pygame.draw.polygon(screen, color, pts, 0 if filled else 2)
+
 
 # [feat] 实现四个方向的路径检测：只判断同一行（左/右）或同一列（上/下）
 def first_arrow_on_path(row, col, direction, arrows, grid):
@@ -212,15 +351,42 @@ def generate_arrows(grid, count, tangle_bias=0.0):
         placed[(r, c)] = d
     return placed
 
+
+def compute_solution(arrows, grid):
+    """AI 求解：贪心模拟消除顺序（每一步都点一个路径畅通的箭头），0 失误通关。
+
+    返回 [(row, col), ...] 消除顺序列表；由于关卡布局保证可解，正常不会返回 None。
+    """
+    remain = dict(arrows)
+    order = []
+    while remain:
+        target = None
+        for a in remain.values():
+            if first_arrow_on_path(a.row, a.col, a.direction, remain, grid) is None:
+                target = a
+                break
+        if target is None:
+            return None
+        order.append((target.row, target.col))
+        del remain[(target.row, target.col)]
+    return order
+
+
+# ---------------------------------------------------------------------------
+# 游戏对象
+# ---------------------------------------------------------------------------
 class Arrow:
     """网格中的一个单格箭头"""
+
     def __init__(self, row, col, direction):
         self.row = row
         self.col = col
         self.direction = direction
 
+
 class Button:
     """简单的矩形按钮：负责绘制与点击判定"""
+
     def __init__(self, rect, text, callback, font=FONT_BTN):
         self.rect = pygame.Rect(rect)
         self.text = text
@@ -243,8 +409,10 @@ class Button:
     def hit(self, pos):
         return self.rect.collidepoint(pos)
 
+
 class LevelButton(Button):
     """选关界面的关卡按钮：显示关卡号、已获得星级或"未解锁"状态"""
+
     def __init__(self, rect, level, callback):
         super().__init__(rect, "", callback)
         self.level = level
@@ -267,85 +435,11 @@ class LevelButton(Button):
             for i in range(3):
                 draw_star(screen, self.rect.centerx - 26 + i * 26, self.rect.top + 58, 10,
                           GOLD if i < stars else (60, 70, 110), filled=i < stars)
-# 【核心】点击箭头：路径检测 -> 飞出消除 或 碰撞反馈
-def click_arrow(self, arrow):
-    rect = self.cell_rect(arrow.row, arrow.col)
-    blocker = first_arrow_on_path(arrow.row, arrow.col, arrow.direction,
-                                  self.arrows, self.grid)
-    if blocker is not None:
-        # 路径上有其他箭头：无法消除，消耗 1 次失误机会并提示碰撞
-        self.mistakes_left -= 1
-        self.score = max(0, self.score - 30)
-        play_sound("hit")
-        self.anim = {"kind": "shake", "arrow": arrow, "blocker": blocker,
-                     "t": 0.0, "dur": 0.45}
-        self.floaters.append({"text": "被挡住了！", "x": rect.centerx,
-                              "y": rect.top - 6, "t": 0.0, "dur": 0.9})
-        if self.mistakes_left <= 0:
-            self.set_state("fail")
-    else:
-        # 路径畅通：箭头飞出棋盘
-        play_sound("fly")
-        dc, dr = DIR_VECTORS[arrow.direction]
-        self.anim = {"kind": "fly", "arrow": arrow, "dc": dc, "dr": dr,
-                     "rect0": rect, "dist": self.fly_distance(arrow.direction, rect),
-                     "t": 0.0, "dur": 0.35}
 
-def fly_distance(self, direction, rect):
-    """箭头飞到完全离开棋盘所需的移动距离"""
-    br = self.board_rect()
-    if direction == "right":
-        return br.right - rect.left + 20
-    if direction == "left":
-        return rect.right - br.left + 20
-    if direction == "down":
-        return br.bottom - rect.top + 20
-    return rect.bottom - br.top + 20
 
-def spawn_particles(self, x, y, color):
-    """在箭头飞出棋盘的位置生成一圈光点粒子"""
-    for _ in range(12):
-        ang = random.uniform(0, 2 * math.pi)
-        spd = random.uniform(70, 240)
-        self.particles.append({"x": x, "y": y,
-                               "vx": math.cos(ang) * spd, "vy": math.sin(ang) * spd,
-                               "t": 0.0, "dur": random.uniform(0.25, 0.55), "color": color})
-
-def finish_anim(self):
-    """动画结束回调：飞出动画在此真正消除箭头、计分并判定胜负"""
-    anim, self.anim = self.anim, None
-    if anim["kind"] == "fly":
-        arrow = anim["arrow"]
-        del self.arrows[(arrow.row, arrow.col)]
-        self.score += 100
-        self.undo_stack.append((arrow.row, arrow.col, arrow.direction))
-        if self.hint and self.hint["cell"] == (arrow.row, arrow.col):
-            self.hint = None
-        ex = anim["rect0"].centerx + anim["dc"] * anim["dist"]
-        ey = anim["rect0"].centery + anim["dr"] * anim["dist"]
-        self.spawn_particles(ex, ey, DIR_COLORS[arrow.direction])
-        if not self.arrows:      # 本关箭头全部消除 -> 过关
-            self.set_state("win")
-        elif self.ai_solving:
-            self.ai_step()
-    # shake 动画结束无需额外处理（颜色在绘制时已恢复）
-
-def draw_shaking_arrow(self, screen):
-    a = self.anim
-    arrow = a["arrow"]
-    p = a["t"] / a["dur"]
-    # 晃动：上下箭头左右晃、左右箭头上下晃，幅度逐渐衰减
-    off = math.sin(p * math.pi * 5) * 5 * (1 - p)
-    rect = self.cell_rect(arrow.row, arrow.col)
-    if arrow.direction in ("up", "down"):
-        rect = rect.move(round(off), 0)
-    else:
-        rect = rect.move(0, round(off))
-    # 红色闪烁
-    color = lerp_color(DIR_COLORS[arrow.direction], RED, math.sin(p * math.pi))
-    self.draw_arrow(screen, arrow, rect, color)
 class Game:
     """游戏主逻辑：选关、关卡管理、点击判定、动画、音效与绘制"""
+
     def __init__(self):
         self.quit = False
         self.progress = load_progress()   # 存档：解锁进度 / 星级 / 无尽最高分
@@ -388,6 +482,7 @@ class Game:
         self.menu_btns[1].rect.center = (WINDOW_W // 2, 545)
 
     # ---------------- 关卡管理 ----------------
+    # [feat] 增加关卡切换功能：按 LEVELS 配置加载指定关卡，并重置本关所有状态
     def load_level(self, level):
         self.mode = "level"
         self.level = level
@@ -467,3 +562,460 @@ class Game:
 
     def quit_game(self):
         self.quit = True
+
+    # ---------------- 坐标换算 ----------------
+    def board_rect(self):
+        size = self.grid * CELL
+        ox = (WINDOW_W - size) // 2
+        oy = TOP_H + (WINDOW_H - TOP_H - BOTTOM_H - size) // 2
+        return pygame.Rect(ox, oy, size, size)
+
+    def cell_rect(self, row, col):
+        br = self.board_rect()
+        return pygame.Rect(br.left + col * CELL, br.top + row * CELL, CELL, CELL)
+
+    def cell_at(self, pos):
+        """把鼠标坐标换算成格子 (row, col)，不在棋盘内返回 None"""
+        br = self.board_rect()
+        if not br.collidepoint(pos):
+            return None
+        return ((pos[1] - br.top) // CELL, (pos[0] - br.left) // CELL)
+
+    # ---------------- 点击与判定（核心逻辑） ----------------
+    # 【核心】所有鼠标点击的统一入口：按当前界面状态分发给对应按钮或棋盘格子
+    def handle_click(self, pos):
+        if self.state == "menu":
+            for btn in self.level_btns:
+                if btn.hit(pos):
+                    if btn.level <= self.progress["unlocked"]:
+                        play_sound("click")
+                        self.start_level(btn.level)
+                    else:
+                        play_sound("hit")   # 未解锁提示音
+                    return
+            for btn in self.menu_btns:
+                if btn.hit(pos):
+                    play_sound("click")
+                    btn.callback()
+                    return
+        elif self.state == "play":
+            for btn in self.play_btns:
+                if not btn.disabled and btn.hit(pos):
+                    play_sound("click")
+                    btn.callback()
+                    return
+            if self.ai_solving or self.anim:
+                return      # AI 求解 / 动画期间锁定棋盘输入
+            cell = self.cell_at(pos)
+            if cell and cell in self.arrows:
+                self.click_arrow(self.arrows[cell])
+        elif self.state in ("win", "fail"):
+            for btn in self.overlay_btns:
+                if btn.hit(pos):
+                    play_sound("click")
+                    btn.callback()
+                    return
+
+    # 【核心】点击箭头：路径检测 -> 飞出消除 或 碰撞反馈
+    # [feat] 增加碰撞反馈和失误次数：被阻挡时晃动+变红+文字提示，每碰撞一次扣 1 次失误机会
+    def click_arrow(self, arrow):
+        rect = self.cell_rect(arrow.row, arrow.col)
+        blocker = first_arrow_on_path(arrow.row, arrow.col, arrow.direction,
+                                      self.arrows, self.grid)
+        if blocker is not None:
+            # 路径上有其他箭头：无法消除，消耗 1 次失误机会并提示碰撞
+            self.mistakes_left -= 1
+            self.score = max(0, self.score - 30)
+            play_sound("hit")
+            self.anim = {"kind": "shake", "arrow": arrow, "blocker": blocker,
+                         "t": 0.0, "dur": 0.45}
+            self.floaters.append({"text": "被挡住了！", "x": rect.centerx,
+                                  "y": rect.top - 6, "t": 0.0, "dur": 0.9})
+            if self.mistakes_left <= 0:
+                self.set_state("fail")
+        else:
+            # 路径畅通：箭头飞出棋盘
+            play_sound("fly")
+            dc, dr = DIR_VECTORS[arrow.direction]
+            self.anim = {"kind": "fly", "arrow": arrow, "dc": dc, "dr": dr,
+                         "rect0": rect, "dist": self.fly_distance(arrow.direction, rect),
+                         "t": 0.0, "dur": 0.35}
+
+    def fly_distance(self, direction, rect):
+        """箭头飞到完全离开棋盘所需的移动距离"""
+        br = self.board_rect()
+        if direction == "right":
+            return br.right - rect.left + 20
+        if direction == "left":
+            return rect.right - br.left + 20
+        if direction == "down":
+            return br.bottom - rect.top + 20
+        return rect.bottom - br.top + 20
+
+    # ---------------- 增强功能：提示 / 撤销 / AI ----------------
+    def use_hint(self):
+        """提示：高亮一个路径畅通、可直接消除的箭头（每关 3 次）"""
+        if self.anim or self.ai_solving or self.hints_left <= 0:
+            return
+        for a in self.arrows.values():
+            if first_arrow_on_path(a.row, a.col, a.direction, self.arrows, self.grid) is None:
+                self.hints_left -= 1
+                self.hint = {"cell": (a.row, a.col), "t": 2.5}
+                play_sound("hint")
+                return
+
+    def undo_last(self):
+        """撤销上一步：恢复最近消除的箭头并扣回得分（失误不可撤销）"""
+        if self.state != "play" or self.anim or self.ai_solving:
+            return
+        if not self.undo_stack:
+            return
+        r, c, d = self.undo_stack.pop()
+        self.arrows[(r, c)] = Arrow(r, c, d)
+        self.score = max(0, self.score - 100)
+        play_sound("undo")
+
+    def start_ai_solve(self):
+        """AI 自动求解：按贪心顺序逐个点击安全箭头，0 失误通关"""
+        if self.anim or self.ai_solving:
+            return
+        order = compute_solution(self.arrows, self.grid)
+        if not order:
+            return
+        self.ai_solving = True
+        self.ai_order = order
+        self.ai_step()
+
+    def ai_step(self):
+        """AI 求解的下一步：按预计算顺序点击下一个仍存在的箭头"""
+        if not self.ai_order:
+            self.ai_order = compute_solution(self.arrows, self.grid) or []
+        while self.ai_order:
+            cell = self.ai_order.pop(0)
+            if cell in self.arrows:
+                self.click_arrow(self.arrows[cell])
+                return
+        self.ai_solving = False
+
+    # ---------------- 状态切换与结算 ----------------
+    def set_state(self, state):
+        self.state = state
+        self.ai_solving = False
+        if state == "win":
+            play_sound("win")
+            if self.mode == "level":
+                # 星级评价：0 失误 3 星，1 次失误 2 星，其余 1 星
+                used = self.mistakes_total - self.mistakes_left
+                self.win_stars = 3 if used == 0 else 2 if used == 1 else 1
+                best = self.progress["stars"].get(self.level, 0)
+                self.progress["stars"][self.level] = max(best, self.win_stars)
+                if self.level < len(LEVELS):
+                    self.progress["unlocked"] = max(self.progress["unlocked"], self.level + 1)
+            else:
+                self.progress["endless_best"] = max(self.progress["endless_best"], self.score)
+            save_progress(self.progress)
+            if self.mode == "level" and self.level < len(LEVELS):
+                self._add_overlay_buttons([("进入下一关", self.next_level),
+                                           ("返回选关", self.enter_menu)])
+            elif self.mode == "endless":
+                self._add_overlay_buttons([("继续挑战", self.next_level),
+                                           ("返回选关", self.enter_menu)])
+            else:
+                self._add_overlay_buttons([("返回选关", self.enter_menu)])
+        elif state == "fail":
+            play_sound("fail")
+            self._add_overlay_buttons([("重新开始", self.restart_level),
+                                       ("返回选关", self.enter_menu)])
+
+    def _add_overlay_buttons(self, pairs):
+        self.overlay_btns = []
+        n = len(pairs)
+        for i, (text, cb) in enumerate(pairs):
+            btn = Button(pygame.Rect(0, 0, 220, 46), text, cb)
+            btn.rect.center = (int(WINDOW_W // 2 + (i - (n - 1) / 2) * 244), 448)
+            self.overlay_btns.append(btn)
+
+    def spawn_particles(self, x, y, color):
+        """在箭头飞出棋盘的位置生成一圈光点粒子"""
+        for _ in range(12):
+            ang = random.uniform(0, 2 * math.pi)
+            spd = random.uniform(70, 240)
+            self.particles.append({"x": x, "y": y,
+                                   "vx": math.cos(ang) * spd, "vy": math.sin(ang) * spd,
+                                   "t": 0.0, "dur": random.uniform(0.25, 0.55), "color": color})
+
+    # ---------------- 更新与动画（核心循环） ----------------
+    # 【核心】每帧更新：推进动画/粒子/提示计时，累计本关用时
+    def update(self, dt):
+        if self.state == "play":
+            self.elapsed += dt
+        if self.anim:
+            self.anim["t"] += dt
+            if self.anim["t"] >= self.anim["dur"]:
+                self.finish_anim()
+        for f in self.floaters:
+            f["t"] += dt
+        self.floaters = [f for f in self.floaters if f["t"] < f["dur"]]
+        for p in self.particles:
+            p["x"] += p["vx"] * dt
+            p["y"] += p["vy"] * dt
+            p["t"] += dt
+        self.particles = [p for p in self.particles if p["t"] < p["dur"]]
+        if self.hint:
+            self.hint["t"] -= dt
+            if self.hint["t"] <= 0 or self.hint["cell"] not in self.arrows:
+                self.hint = None
+
+    # 【核心】动画结束回调：飞出动画在此真正消除箭头、计分并判定胜负
+    def finish_anim(self):
+        anim, self.anim = self.anim, None
+        if anim["kind"] == "fly":
+            arrow = anim["arrow"]
+            del self.arrows[(arrow.row, arrow.col)]
+            self.score += 100
+            self.undo_stack.append((arrow.row, arrow.col, arrow.direction))
+            if self.hint and self.hint["cell"] == (arrow.row, arrow.col):
+                self.hint = None
+            ex = anim["rect0"].centerx + anim["dc"] * anim["dist"]
+            ey = anim["rect0"].centery + anim["dr"] * anim["dist"]
+            self.spawn_particles(ex, ey, DIR_COLORS[arrow.direction])
+            if not self.arrows:      # 本关箭头全部消除 -> 过关
+                self.set_state("win")
+            elif self.ai_solving:
+                self.ai_step()
+        # shake 动画结束无需额外处理（颜色在绘制时已恢复）
+
+    # ---------------- 绘制 ----------------
+    def draw(self, screen):
+        if self.state == "menu":
+            self.draw_menu(screen)
+        else:
+            self.draw_play(screen)
+
+    def draw_menu(self, screen):
+        """选关界面：标题、关卡按钮（含星级/解锁状态）、无尽模式与退出"""
+        mouse = pygame.mouse.get_pos()
+        screen.fill(BG)
+        shadow = FONT_BIG.render("箭头消消乐", True, ACCENT)
+        title = FONT_BIG.render("箭头消消乐", True, TEXT)
+        screen.blit(shadow, shadow.get_rect(center=(WINDOW_W // 2 + 3, 93)))
+        screen.blit(title, title.get_rect(center=(WINDOW_W // 2, 90)))
+        sub = FONT_SMALL.render("赛博箭场 · CYBER ARROWS", True, ACCENT2)
+        screen.blit(sub, sub.get_rect(center=(WINDOW_W // 2, 140)))
+        total_stars = sum(self.progress["stars"].values())
+        info = FONT_MED.render(f"总星数：{total_stars}/18   无尽最高分：{self.progress['endless_best']}",
+                               True, HINT)
+        screen.blit(info, info.get_rect(center=(WINDOW_W // 2, 178)))
+        for btn in self.level_btns:
+            btn.draw(screen, mouse, self.progress["stars"].get(btn.level, 0),
+                     btn.level > self.progress["unlocked"])
+        for btn in self.menu_btns:
+            btn.draw(screen, mouse)
+        tip = FONT_SMALL.render("通关当前关卡即可解锁下一关", True, HINT)
+        screen.blit(tip, tip.get_rect(center=(WINDOW_W // 2, 630)))
+
+    def draw_play(self, screen):
+        mouse = pygame.mouse.get_pos()
+        screen.fill(BG)
+
+        # 顶部信息栏：关卡 / 时间 / 得分 / 失误机会
+        mode_label = f"第 {self.level} 关" if self.mode == "level" else f"无尽 · 第 {self.level} 关"
+        level_surf = FONT_MED.render(mode_label, True, TEXT)
+        screen.blit(level_surf, (30, 26))
+        time_surf = FONT_MED.render(f"时间 {fmt_time(self.elapsed)}", True, TEXT)
+        screen.blit(time_surf, (WINDOW_W - time_surf.get_width() - 30, 26))
+        score_surf = FONT_MED.render(f"得分 {self.score}", True, TEXT)
+        screen.blit(score_surf, (30, 64))
+        mis_label = FONT_MED.render("失误机会：", True, TEXT)
+        heart_w = 26
+        x0 = WINDOW_W - 30 - mis_label.get_width() - self.mistakes_total * heart_w
+        screen.blit(mis_label, (x0, 64))
+        for i in range(self.mistakes_total):   # 心形矢量绘制，剩余实心红、失去空心灰
+            hx = x0 + mis_label.get_width() + 13 + i * heart_w
+            draw_heart(screen, hx, 78, 20, RED if i < self.mistakes_left else HEART_EMPTY,
+                       filled=i < self.mistakes_left)
+        if self.ai_solving:
+            ai = FONT_SMALL.render("AI 求解中…", True, ACCENT)
+            screen.blit(ai, ai.get_rect(center=(WINDOW_W // 2, 100)))
+
+        # [feat] 完成游戏棋盘和箭头显示：绘制棋盘背景、网格线与四个方向的箭头
+        br = self.board_rect()
+        pygame.draw.rect(screen, scaled_color(ACCENT, 0.18), br.inflate(12, 12), 2, border_radius=16)
+        pygame.draw.rect(screen, BOARD_BG, br, border_radius=12)
+        pygame.draw.rect(screen, BOARD_EDGE, br, 2, border_radius=12)
+        for r in range(self.grid):
+            for c in range(self.grid):
+                pygame.draw.rect(screen, CELL_BORDER, self.cell_rect(r, c), 1)
+
+        # 棋盘正下方：剩余箭头数量
+        left_surf = FONT_MED.render(f"剩余箭头：{len(self.arrows)} 个", True, TEXT)
+        screen.blit(left_surf, left_surf.get_rect(center=(WINDOW_W // 2, br.bottom + 18)))
+
+        # 悬停高亮（仅正常游戏状态且无动画时）
+        if self.state == "play" and not self.anim and not self.ai_solving:
+            cell = self.cell_at(mouse)
+            if cell and cell in self.arrows:
+                pygame.draw.rect(screen, CELL_HOVER, self.cell_rect(*cell))
+
+        # 碰撞时高亮显示阻挡的箭头
+        if self.anim and self.anim["kind"] == "shake":
+            b = self.anim["blocker"]
+            pygame.draw.rect(screen, YELLOW, self.cell_rect(b.row, b.col), 3, border_radius=8)
+
+        # 提示功能：高亮脉冲光圈
+        if self.hint and self.hint["cell"] in self.arrows:
+            r, c = self.hint["cell"]
+            rect = self.cell_rect(r, c)
+            k = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.012)
+            pygame.draw.rect(screen, scaled_color(YELLOW, 0.35 + 0.45 * k),
+                             rect.inflate(int(10 * k), int(10 * k)), 3, border_radius=10)
+            pygame.draw.rect(screen, YELLOW, rect, 2, border_radius=8)
+
+        # 绘制箭头（动画中的箭头单独绘制）
+        for arrow in self.arrows.values():
+            if self.anim and self.anim["kind"] == "fly" and self.anim["arrow"] is arrow:
+                continue
+            self.draw_arrow(screen, arrow, self.cell_rect(arrow.row, arrow.col),
+                            DIR_COLORS[arrow.direction])
+        if self.anim and self.anim["kind"] == "fly":
+            self.draw_flying_arrow(screen)
+        if self.anim and self.anim["kind"] == "shake":
+            self.draw_shaking_arrow(screen)
+
+        # 粒子（箭头飞出棋盘时的光点）
+        for p in self.particles:
+            k = 1 - p["t"] / p["dur"]
+            pygame.draw.circle(screen, scaled_color(p["color"], max(0.15, k)),
+                               (int(p["x"]), int(p["y"])), max(1, int(3 * k)))
+
+        # 浮动提示文字（碰撞时显示"被挡住了！"并向上飘散）
+        for f in self.floaters:
+            p = f["t"] / f["dur"]
+            surf = FONT_FLOAT.render(f["text"], True, RED)
+            surf.set_alpha(int(255 * (1 - p)))
+            screen.blit(surf, surf.get_rect(center=(f["x"], f["y"] - 30 * p)))
+
+        # 底部：规则提示 + 方向图例 + 操作按钮
+        hint = FONT_SMALL.render("点击箭头：前方无阻挡即可飞出消除；撞到其他箭头消耗 1 次失误机会",
+                                 True, HINT)
+        screen.blit(hint, hint.get_rect(center=(WINDOW_W // 2, 700)))
+        self.draw_legend(screen)
+        self.hint_btn.text = f"提示 ×{self.hints_left}"
+        self.hint_btn.disabled = self.hints_left <= 0
+        self.undo_btn.disabled = not self.undo_stack
+        for btn in self.play_btns:
+            btn.draw(screen, mouse)
+
+        # 结算遮罩（过关 / 失败）
+        if self.state in ("win", "fail"):
+            self.draw_overlay(screen, mouse)
+
+    def draw_arrow(self, screen, arrow, rect, color):
+        poly = arrow_polygon(rect.inflate(-28, -28), arrow.direction)
+        draw_neon_polygon(screen, poly, color)
+
+    def draw_flying_arrow(self, screen):
+        """飞出动画：缓动加速 + 逐渐缩小 + 拖尾残影，模拟飞远"""
+        a = self.anim
+        arrow = a["arrow"]
+        p = min(a["t"] / a["dur"], 1.0)
+        pe = 1 - (1 - p) ** 2                  # 缓出：越飞越快
+        d = a["dist"] * pe
+        for ghost in range(3, 0, -1):          # 拖尾残影
+            rect = a["rect0"].move(round(a["dc"] * d * (1 - 0.14 * ghost)),
+                                   round(a["dr"] * d * (1 - 0.14 * ghost)))
+            poly = arrow_polygon(rect.inflate(-28, -28), arrow.direction)
+            pygame.draw.polygon(screen, scaled_color(DIR_COLORS[arrow.direction],
+                                                     0.10 * ghost), poly)
+        rect = a["rect0"].move(round(a["dc"] * d), round(a["dr"] * d))
+        k = 0.3 * p                            # 逐渐缩小，模拟飞远
+        rect = rect.inflate(-round(rect.width * k), -round(rect.height * k))
+        self.draw_arrow(screen, arrow, rect, DIR_COLORS[arrow.direction])
+
+    def draw_shaking_arrow(self, screen):
+        a = self.anim
+        arrow = a["arrow"]
+        p = a["t"] / a["dur"]
+        # 晃动：上下箭头左右晃、左右箭头上下晃，幅度逐渐衰减
+        off = math.sin(p * math.pi * 5) * 5 * (1 - p)
+        rect = self.cell_rect(arrow.row, arrow.col)
+        if arrow.direction in ("up", "down"):
+            rect = rect.move(round(off), 0)
+        else:
+            rect = rect.move(0, round(off))
+        # 红色闪烁
+        color = lerp_color(DIR_COLORS[arrow.direction], RED, math.sin(p * math.pi))
+        self.draw_arrow(screen, arrow, rect, color)
+
+    def draw_legend(self, screen):
+        """底部图例：展示四个方向对应的霓虹颜色"""
+        item_w = 76
+        start = WINDOW_W // 2 - len(DIR_ORDER) * item_w // 2
+        for i, d in enumerate(DIR_ORDER):
+            cx = start + i * item_w + item_w // 2
+            rect = pygame.Rect(0, 0, 22, 22)
+            rect.center = (cx - 14, 728)
+            pygame.draw.polygon(screen, DIR_COLORS[d], arrow_polygon(rect, d))
+            name = FONT_SMALL.render(DIR_NAMES[d], True, HINT)
+            screen.blit(name, name.get_rect(midleft=(cx + 1, 728)))
+
+    def draw_overlay(self, screen, mouse):
+        """结算面板：过关显示星级/得分/用时，失败显示重试按钮"""
+        dim = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 160))
+        screen.blit(dim, (0, 0))
+        panel = pygame.Rect(0, 0, 460, 280)
+        panel.center = (WINDOW_W // 2, WINDOW_H // 2 - 30)
+        pygame.draw.rect(screen, PANEL_BG, panel, border_radius=16)
+        pygame.draw.rect(screen, ACCENT, panel, 2, border_radius=16)
+        if self.state == "win":
+            title = f"第 {self.level} 关通过！" if self.mode == "level" else f"无尽 · 第 {self.level} 关通过！"
+            if self.mode == "level":
+                for i in range(3):     # 星级评价
+                    draw_star(screen, WINDOW_W // 2 - 56 + i * 56, panel.top + 104, 22,
+                              GOLD if i < self.win_stars else (60, 70, 110),
+                              filled=i < self.win_stars)
+                used = self.mistakes_total - self.mistakes_left
+                sub = f"得分 {self.score} · 用时 {fmt_time(self.elapsed)} · 失误 {used} 次"
+            else:
+                sub = f"得分 {self.score} · 用时 {fmt_time(self.elapsed)}"
+        else:
+            title = "本关失败！"
+            sub = "失误机会已用完，再试一次吧！"
+        t = FONT_OVERLAY.render(title, True, TEXT)
+        screen.blit(t, t.get_rect(center=(WINDOW_W // 2, panel.top + 52)))
+        s = FONT_SUB.render(sub, True, HINT)
+        screen.blit(s, s.get_rect(center=(WINDOW_W // 2, panel.top + 148)))
+        for btn in self.overlay_btns:
+            btn.draw(screen, mouse)
+
+
+# ---------------------------------------------------------------------------
+# 主循环
+# ---------------------------------------------------------------------------
+def main():
+    pygame.init()
+    pygame.display.set_caption("箭头消消乐")
+    screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
+    init_sounds()       # 音效初始化（设备不可用时静音运行）
+    clock = pygame.time.Clock()
+    game = Game()
+    # ================= 核心运行代码 =================
+    # 游戏主循环三步走：① 处理事件（鼠标点击/关闭窗口）→ ② 更新动画与计时 → ③ 绘制画面
+    # 用 clock.tick 固定每秒 60 帧，dt 为帧间隔秒数，保证动画速度与帧率无关
+    while not game.quit:
+        dt = clock.tick(FPS) / 1000.0
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                game.quit = True
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                game.handle_click(event.pos)
+        game.update(dt)
+        game.draw(screen)
+        pygame.display.flip()
+    pygame.quit()
+    sys.exit()
+
+
+if __name__ == "__main__":
+    main()
