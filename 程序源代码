@@ -206,3 +206,80 @@ class LevelButton(Button):
             for i in range(3):
                 draw_star(screen, self.rect.centerx - 26 + i * 26, self.rect.top + 58, 10,
                           GOLD if i < stars else (60, 70, 110), filled=i < stars)
+# 【核心】点击箭头：路径检测 -> 飞出消除 或 碰撞反馈
+def click_arrow(self, arrow):
+    rect = self.cell_rect(arrow.row, arrow.col)
+    blocker = first_arrow_on_path(arrow.row, arrow.col, arrow.direction,
+                                  self.arrows, self.grid)
+    if blocker is not None:
+        # 路径上有其他箭头：无法消除，消耗 1 次失误机会并提示碰撞
+        self.mistakes_left -= 1
+        self.score = max(0, self.score - 30)
+        play_sound("hit")
+        self.anim = {"kind": "shake", "arrow": arrow, "blocker": blocker,
+                     "t": 0.0, "dur": 0.45}
+        self.floaters.append({"text": "被挡住了！", "x": rect.centerx,
+                              "y": rect.top - 6, "t": 0.0, "dur": 0.9})
+        if self.mistakes_left <= 0:
+            self.set_state("fail")
+    else:
+        # 路径畅通：箭头飞出棋盘
+        play_sound("fly")
+        dc, dr = DIR_VECTORS[arrow.direction]
+        self.anim = {"kind": "fly", "arrow": arrow, "dc": dc, "dr": dr,
+                     "rect0": rect, "dist": self.fly_distance(arrow.direction, rect),
+                     "t": 0.0, "dur": 0.35}
+
+def fly_distance(self, direction, rect):
+    """箭头飞到完全离开棋盘所需的移动距离"""
+    br = self.board_rect()
+    if direction == "right":
+        return br.right - rect.left + 20
+    if direction == "left":
+        return rect.right - br.left + 20
+    if direction == "down":
+        return br.bottom - rect.top + 20
+    return rect.bottom - br.top + 20
+
+def spawn_particles(self, x, y, color):
+    """在箭头飞出棋盘的位置生成一圈光点粒子"""
+    for _ in range(12):
+        ang = random.uniform(0, 2 * math.pi)
+        spd = random.uniform(70, 240)
+        self.particles.append({"x": x, "y": y,
+                               "vx": math.cos(ang) * spd, "vy": math.sin(ang) * spd,
+                               "t": 0.0, "dur": random.uniform(0.25, 0.55), "color": color})
+
+def finish_anim(self):
+    """动画结束回调：飞出动画在此真正消除箭头、计分并判定胜负"""
+    anim, self.anim = self.anim, None
+    if anim["kind"] == "fly":
+        arrow = anim["arrow"]
+        del self.arrows[(arrow.row, arrow.col)]
+        self.score += 100
+        self.undo_stack.append((arrow.row, arrow.col, arrow.direction))
+        if self.hint and self.hint["cell"] == (arrow.row, arrow.col):
+            self.hint = None
+        ex = anim["rect0"].centerx + anim["dc"] * anim["dist"]
+        ey = anim["rect0"].centery + anim["dr"] * anim["dist"]
+        self.spawn_particles(ex, ey, DIR_COLORS[arrow.direction])
+        if not self.arrows:      # 本关箭头全部消除 -> 过关
+            self.set_state("win")
+        elif self.ai_solving:
+            self.ai_step()
+    # shake 动画结束无需额外处理（颜色在绘制时已恢复）
+
+def draw_shaking_arrow(self, screen):
+    a = self.anim
+    arrow = a["arrow"]
+    p = a["t"] / a["dur"]
+    # 晃动：上下箭头左右晃、左右箭头上下晃，幅度逐渐衰减
+    off = math.sin(p * math.pi * 5) * 5 * (1 - p)
+    rect = self.cell_rect(arrow.row, arrow.col)
+    if arrow.direction in ("up", "down"):
+        rect = rect.move(round(off), 0)
+    else:
+        rect = rect.move(0, round(off))
+    # 红色闪烁
+    color = lerp_color(DIR_COLORS[arrow.direction], RED, math.sin(p * math.pi))
+    self.draw_arrow(screen, arrow, rect, color)
