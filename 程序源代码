@@ -151,6 +151,67 @@ def draw_star(screen, cx, cy, size, color, filled=True):
         pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
     pygame.draw.polygon(screen, color, pts, 0 if filled else 2)
 
+# [feat] 实现四个方向的路径检测：只判断同一行（左/右）或同一列（上/下）
+def first_arrow_on_path(row, col, direction, arrows, grid):
+    """返回 (row, col) 沿 direction 到棋盘边界路径上的第一个箭头，没有则返回 None。
+
+    [fix] 修复向上检测时的数组越界：循环条件统一用 0 <= r < grid 且 0 <= c < grid
+    限定索引范围，向上越过第 0 行（r 变为 -1）时安全退出循环，不会访问负数下标。
+    """
+    dc, dr = DIR_VECTORS[direction]
+    r, c = row + dr, col + dc
+    while 0 <= r < grid and 0 <= c < grid:
+        if (r, c) in arrows:
+            return arrows[(r, c)]
+        r += dr
+        c += dc
+    return None
+
+
+def cell_on_any_ray(row, col, placed, grid):
+    """(row, col) 是否落在某个已放置箭头到边界的路径上（即会挡住那个箭头）"""
+    for (pr, pc), pd in placed.items():
+        dc, dr = DIR_VECTORS[pd]
+        r, c = pr + dr, pc + dc
+        while 0 <= r < grid and 0 <= c < grid:
+            if (r, c) == (row, col):
+                return True
+            r += dr
+            c += dc
+    return False
+
+
+def generate_arrows(grid, count, tangle_bias=0.0):
+    """生成一个保证有解（存在 0 失误通关顺序）的随机箭头布局。
+
+    采用反向构造法：按"消除顺序的逆序"逐个放置箭头——先放置的箭头最后被消除，
+    后放置的箭头必须保证其到边界的路径上没有已放置的箭头。这样构造出的布局，
+    按放置的逆序逐个点击即可全部消除。
+
+    tangle_bias 为"缠绕程度"（0~1）：越大的值，新箭头越倾向于放在已有箭头的
+    路径上，使初始棋盘出现更多互相阻挡的箭头链，玩家更难一眼找出安全箭头。
+    """
+    placed = {}  # (row, col) -> direction
+    for _ in range(count):
+        cells = [(r, c) for r in range(grid) for c in range(grid) if (r, c) not in placed]
+        random.shuffle(cells)
+        options = []        # 所有合法放置
+        tangle_options = [] # 会挡在已有箭头路径上的放置（布局更缠人）
+        for r, c in cells:
+            for d in DIR_ORDER:
+                if first_arrow_on_path(r, c, d, placed, grid) is None:
+                    options.append((r, c, d))
+                    if cell_on_any_ray(r, c, placed, grid):
+                        tangle_options.append((r, c, d))
+        if not options:
+            return None  # 没有合法的放置位置（箭头密度过高）
+        if tangle_options and random.random() < tangle_bias:
+            r, c, d = random.choice(tangle_options)
+        else:
+            r, c, d = random.choice(options)
+        placed[(r, c)] = d
+    return placed
+
 class Arrow:
     """网格中的一个单格箭头"""
     def __init__(self, row, col, direction):
