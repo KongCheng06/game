@@ -1,0 +1,208 @@
+import json
+import math
+import os
+import random
+import sys
+
+import pygame
+# 基本配置
+# ---------------------------------------------------------------------------
+WINDOW_W, WINDOW_H = 660, 860    # 窗口大小
+CELL = 88                        # 每个格子的边长（像素）
+TOP_H = 110                      # 顶部信息栏高度
+BOTTOM_H = 220                   # 底部按钮区高度
+FPS = 60
+
+# 关卡配置：每关为 (网格边长, 箭头数量, 失误机会, 缠绕程度 0~1)。
+# 网格越大、箭头越密、失误机会越少、布局越"缠绕"，难度越高，逐关递增，最后一关最难。
+LEVELS = [
+    (4, 5, 5, 0.10),
+    (4, 8, 4, 0.20),
+    (5, 10, 4, 0.35),
+    (5, 13, 3, 0.50),
+    (6, 16, 3, 0.65),
+    (6, 20, 2, 0.80),
+]
+
+# 四个方向：值为 (列偏移, 行偏移)，行向下增长、列向右增长
+DIR_VECTORS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
+DIR_NAMES = {"up": "上", "down": "下", "left": "左", "right": "右"}
+DIR_ORDER = ["up", "down", "left", "right"]
+
+# 赛博朋克配色：深色背景 + 霓虹点缀
+BG = (13, 15, 30)               # 窗口背景（深夜蓝黑）
+BOARD_BG = (17, 21, 40)         # 棋盘背景
+BOARD_EDGE = (46, 84, 138)      # 棋盘外框
+CELL_BORDER = (44, 58, 96)      # 网格线（冷蓝）
+CELL_HOVER = (36, 48, 92)       # 鼠标悬停高亮
+TEXT = (205, 232, 255)          # 主文字（冰蓝白）
+HINT = (110, 132, 176)          # 提示文字（灰蓝）
+DIM = (85, 95, 125)             # 禁用文字
+ACCENT = (0, 229, 255)          # 主霓虹色（电光青）
+ACCENT2 = (255, 64, 180)        # 副霓虹色（霓虹粉）
+RED = (255, 66, 99)             # 碰撞提示 / 失误
+YELLOW = (255, 214, 64)         # 阻挡箭头 / 提示高亮
+GOLD = (255, 196, 48)           # 星级
+HEART_EMPTY = (60, 70, 110)     # 已失去的失误机会（空心心形描边色）
+WHITE = (240, 248, 255)
+BTN_BG = (24, 30, 62)           # 按钮底色
+BTN_HOVER = (38, 48, 92)        # 按钮悬停色
+BTN_DISABLED_BG = (22, 25, 44)  # 按钮禁用底色
+BTN_BORDER = ACCENT             # 按钮霓虹描边
+PANEL_BG = (20, 24, 52)         # 结算面板底色
+# 不同方向的箭头使用不同霓虹色，便于观察
+DIR_COLORS = {"up": (57, 255, 120), "down": (0, 210, 255),
+              "left": (255, 214, 64), "right": (255, 64, 180)}
+
+# 字体、绘制工具函数
+def get_font(size, bold=False):
+    """尽量匹配中文字体，保证中文正常显示"""
+    if not pygame.font.get_init():
+        pygame.font.init()
+    for name in ("microsoftyahei", "msyh", "simhei", "simsun", "dengxian"):
+        path = pygame.font.match_font(name, bold=bold)
+        if path:
+            return pygame.font.Font(path, size)
+    return pygame.font.SysFont(None, size, bold=bold)
+
+FONT_BIG = get_font(52, True)
+FONT_TITLE = get_font(38, True)
+FONT_MED = get_font(24)
+FONT_SMALL = get_font(17)
+FONT_FLOAT = get_font(22, True)
+FONT_BTN = get_font(20)
+FONT_OVERLAY = get_font(32, True)
+FONT_SUB = get_font(18)
+
+def fmt_time(sec):
+    """秒数格式化为 mm:ss"""
+    return f"{int(sec) // 60:02d}:{int(sec) % 60:02d}"
+
+def scaled_color(c, f):
+    """颜色按系数变暗（用于霓虹光晕与粒子渐隐）"""
+    return tuple(int(min(255, x * f)) for x in c)
+
+def lerp_color(c1, c2, t):
+    """颜色线性插值，t 取值 0~1"""
+    return tuple(int(a + (b - a) * t) for a, b in zip(c1, c2))
+
+def grow_polygon(points, m):
+    """多边形按包围盒中心向外扩张 m 像素（用于霓虹光晕）"""
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    w = max(xs) - min(xs) or 1
+    h = max(ys) - min(ys) or 1
+    kx = (w + 2 * m) / w
+    ky = (h + 2 * m) / h
+    cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+    return [(cx + (x - cx) * kx, cy + (y - cy) * ky) for x, y in points]
+
+def draw_neon_polygon(screen, points, color):
+    """霓虹光晕多边形：两层放大的暗色光晕 + 本体"""
+    pygame.draw.polygon(screen, scaled_color(color, 0.22), grow_polygon(points, 9))
+    pygame.draw.polygon(screen, scaled_color(color, 0.50), grow_polygon(points, 4))
+    pygame.draw.polygon(screen, color, points)
+
+def arrow_polygon(rect, direction):
+    """在 rect 范围内生成一个朝 direction 方向的箭头多边形（箭杆 + 三角箭头）"""
+    x0, y0 = rect.left, rect.top
+    x1, y1 = rect.right, rect.bottom
+    cx, cy = rect.center
+    head = (x1 - x0) * 0.42        # 三角箭头长度
+    head_half = (y1 - y0) * 0.30   # 三角箭头半高
+    shaft_half = (y1 - y0) * 0.15  # 箭杆半粗
+    if direction == "right":
+        bx = x1 - head
+        return [(x0, cy - shaft_half), (bx, cy - shaft_half), (bx, cy - head_half),
+                (x1, cy), (bx, cy + head_half), (bx, cy + shaft_half), (x0, cy + shaft_half)]
+    if direction == "left":
+        bx = x0 + head
+        return [(x1, cy - shaft_half), (bx, cy - shaft_half), (bx, cy - head_half),
+                (x0, cy), (bx, cy + head_half), (bx, cy + shaft_half), (x1, cy + shaft_half)]
+    if direction == "down":
+        by = y1 - head
+        return [(cx - shaft_half, y0), (cx - shaft_half, by), (cx - head_half, by),
+                (cx, y1), (cx + head_half, by), (cx + shaft_half, by), (cx + shaft_half, y0)]
+    # up
+    by = y0 + head
+    return [(cx - shaft_half, y1), (cx - shaft_half, by), (cx - head_half, by),
+            (cx, y0), (cx + head_half, by), (cx + shaft_half, by), (cx + shaft_half, y1)]
+
+def draw_heart(screen, cx, cy, size, color, filled=True):
+    """在 (cx, cy) 处矢量绘制一个心形（不依赖字体字形），size 为心形宽高"""
+    r = max(2, size // 4)
+    if filled:
+        pygame.draw.circle(screen, color, (cx - r, cy - r), r)
+        pygame.draw.circle(screen, color, (cx + r, cy - r), r)
+        pygame.draw.polygon(screen, color,
+                            [(cx - 2 * r, cy - r + 1), (cx + 2 * r, cy - r + 1), (cx, cy + 2 * r)])
+    else:
+        pygame.draw.circle(screen, color, (cx - r, cy - r), r, 2)
+        pygame.draw.circle(screen, color, (cx + r, cy - r), r, 2)
+        pygame.draw.polygon(screen, color,
+                            [(cx - 2 * r, cy - r + 1), (cx + 2 * r, cy - r + 1), (cx, cy + 2 * r)], 2)
+
+def draw_star(screen, cx, cy, size, color, filled=True):
+    """在 (cx, cy) 处矢量绘制一个五角星（星级评价用），size 为外接圆半径"""
+    pts = []
+    for i in range(10):
+        r = size if i % 2 == 0 else size * 0.45
+        a = -math.pi / 2 + i * math.pi / 5
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    pygame.draw.polygon(screen, color, pts, 0 if filled else 2)
+
+class Arrow:
+    """网格中的一个单格箭头"""
+    def __init__(self, row, col, direction):
+        self.row = row
+        self.col = col
+        self.direction = direction
+
+class Button:
+    """简单的矩形按钮：负责绘制与点击判定"""
+    def __init__(self, rect, text, callback, font=FONT_BTN):
+        self.rect = pygame.Rect(rect)
+        self.text = text
+        self.callback = callback
+        self.font = font
+        self.disabled = False
+
+    def draw(self, screen, mouse):
+        hovered = not self.disabled and self.rect.collidepoint(mouse)
+        bg, fg, border = BTN_BG, TEXT, BTN_BORDER
+        if self.disabled:
+            bg, fg, border = BTN_DISABLED_BG, DIM, (48, 54, 82)
+        elif hovered:
+            bg = BTN_HOVER
+        pygame.draw.rect(screen, bg, self.rect, border_radius=10)
+        pygame.draw.rect(screen, border, self.rect, 2, border_radius=10)
+        surf = self.font.render(self.text, True, fg)
+        screen.blit(surf, surf.get_rect(center=self.rect.center))
+
+    def hit(self, pos):
+        return self.rect.collidepoint(pos)
+
+class LevelButton(Button):
+    """选关界面的关卡按钮：显示关卡号、已获得星级或"未解锁"状态"""
+    def __init__(self, rect, level, callback):
+        super().__init__(rect, "", callback)
+        self.level = level
+
+    def draw(self, screen, mouse, stars, locked):
+        hovered = not locked and self.rect.collidepoint(mouse)
+        bg = BTN_HOVER if hovered else BTN_BG
+        border = ACCENT
+        label_color = TEXT
+        if locked:
+            bg, border, label_color = (22, 25, 44), (48, 54, 82), DIM
+        pygame.draw.rect(screen, bg, self.rect, border_radius=12)
+        pygame.draw.rect(screen, border, self.rect, 2, border_radius=12)
+        label = FONT_MED.render(f"第 {self.level} 关", True, label_color)
+        screen.blit(label, label.get_rect(center=(self.rect.centerx, self.rect.top + 26)))
+        if locked:
+            t = FONT_SMALL.render("未解锁", True, DIM)
+            screen.blit(t, t.get_rect(center=(self.rect.centerx, self.rect.top + 58)))
+        else:
+            for i in range(3):
+                draw_star(screen, self.rect.centerx - 26 + i * 26, self.rect.top + 58, 10,
+                          GOLD if i < stars else (60, 70, 110), filled=i < stars)
